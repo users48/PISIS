@@ -1,0 +1,146 @@
+import os
+import json
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, models
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm  # для отображения прогрессбара обучения
+import numpy as np
+from sklearn.metrics import classification_report, confusion_matrix
+
+# Настройка путей к папкам
+img_dir = "/home/konstantin/Загрузки/test/images"  # Замените на ваш путь
+annotations_dir = "/home/konstantin/Загрузки/test/json_for_test"  # Замените на ваш путь
+
+# Проверяем, что папки существуют
+assert os.path.exists(img_dir), f"Папка с изображениями не найдена: {img_dir}"
+assert os.path.exists(annotations_dir), f"Папка с аннотациями не найдена: {annotations_dir}"
+
+# Класс для работы с DeepFashion2
+class DeepFashion2Dataset(Dataset):
+    def __init__(self, img_dir, annotations_dir, transform=None):
+        self.img_dir = img_dir
+        self.annotations_dir = annotations_dir
+        self.transform = transform
+        self.img_files = sorted([f for f in os.listdir(self.img_dir) if f.endswith(".jpg")])
+        self.annotation_files = sorted([f for f in os.listdir(self.annotations_dir) if f.endswith(".json")])
+        assert len(self.img_files) == len(self.annotation_files), "Количество изображений и аннотаций не совпадает"
+        self.labels = self.get_labels() #добавлено для получения уникальных лейблов
+        self.classes = list(set(self.labels))
+
+
+    def get_labels(self):
+        labels = []
+        for annotation_path in self.annotation_files:
+            annotation_path = os.path.join(self.annotations_dir, annotation_path)
+            with open(annotation_path, 'r') as f:
+                annotation = json.load(f)
+            label = annotation.get("category_id", 0)
+            labels.append(label)
+        return labels
+
+    def __len__(self):
+        return len(self.img_files)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.img_dir, self.img_files[idx])
+        image = Image.open(img_path).convert("RGB")
+        annotation_path = os.path.join(self.annotations_dir, self.annotation_files[idx])
+        with open(annotation_path, 'r') as f:
+            annotation = json.load(f)
+        label = annotation.get("category_id", 0)
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+# Определяем трансформации для изображений
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),  # Подгоняем размер под вход модели resnet18
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Нормализация для ResNet18
+])
+
+# Создаем объект датасета
+dataset = DeepFashion2Dataset(img_dir=img_dir, annotations_dir=annotations_dir, transform=transform)
+dataset.classes = sorted(list(set(dataset.labels))) # сортируем классы
+
+# Создаем DataLoader для загрузки данных
+dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+# Проверка загрузки данных
+data_iter = iter(dataloader)
+images, labels = next(data_iter)
+
+print(f"Размер батча изображений: {images.size()}")  # Должен быть (batch_size, 3, 224, 224)
+print(f"Метки: {labels}")  # Категории одежды
+
+# Определяем модель (используем предобученную ResNet18)
+model = models.resnet18(pretrained=True)
+num_ftrs = model.fc.in_features
+model.fc = nn.Linear(num_ftrs, len(dataset.classes))  # Замена последнего слоя на количество классов
+
+# Перемещаем модель на GPU, если доступен
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+# Определяем функцию потерь и оптимизатор
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# Функция обучения
+def train_model(model, dataloader, criterion, optimizer, num_epochs=10):
+    model.train()
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        for i, data in tqdm(enumerate(dataloader), desc=f"Epoch {epoch+1}/{num_epochs}"):
+            inputs, labels = data
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {running_loss / len(dataloader):.4f}")
+
+# Функция оценки
+def evaluate_model(model, dataloader, criterion, dataset):
+    model.eval()
+    running_loss = 0.0
+    predictions = []
+    true_labels = []
+    with torch.no_grad():
+        for data in dataloader:
+            inputs, labels = data
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            predictions.extend(predicted.cpu().numpy())
+            true_labels.extend(labels.cpu().numpy())
+
+    accuracy = np.mean(np.array(predictions) == np.array(true_labels))
+    print(classification_report(true_labels, predictions, target_names=dataset.classes))
+    print(confusion_matrix(true_labels, predictions))
+    print(f"Accuracy: {accuracy * 100:.2f}%")
+    print(f"Average Loss: {running_loss / len(dataloader):.4f}")
+
+
+
+#Разделение на тренировочные и тестовые данные (например, 80/20)
+train_size = int(0.8 * len(dataset))
+test_size = len(dataset) - train_size
+train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
+train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+# Обучение модели
+train_model(model, train_dataloader, criterion, optimizer, num_epochs=10)
+
+# Оценка модели
+evaluate_model(model, test_dataloader, criterion, dataset)
